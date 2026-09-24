@@ -1,0 +1,78 @@
+# Machine-readable controls the agent is bound by.
+# Values are defaults; align them with the bank fraud policy in the dataset
+# (scripts/inspect_dataset.py prints the bank policy text so these values can be aligned with it).
+
+meta:
+  # placeholder_defaults -> values below are engineering defaults (US SAR thresholds, generic approval tiers),
+  #                         NOT yet reconciled with the bank policy shipped in HHGOA_IEEE.
+  # aligned_with_dataset -> set after reviewing the dataset policy; record the document + date in `aligned_with`.
+  status: placeholder_defaults
+  aligned_with: null
+
+decision:
+  # posterior P(fraud) thresholds
+  act_fraud: 0.80          # >= : enough evidence to act as fraud
+  act_clear: 0.15          # <= : enough evidence to clear
+  min_confidence: 0.65     # confidence below this is never "enough evidence"
+  max_evidence_rounds: 2   # after this, escalate instead of asking again
+
+# Who may execute each action.
+#   auto      – agent may execute (stubbed API call) without a human
+#   analyst   – agent recommends; a fraud analyst must approve
+#   senior    – senior analyst / fraud manager approval
+#   compliance– BSA/AML compliance officer (SAR filing)
+#   never     – agent can never execute; recommendation only
+actions:
+  allow_transaction:      {route: auto,       reversible: true}
+  hold_transaction:       {route: auto,       reversible: true}
+  block_transaction:      {route: auto,       reversible: true,  max_amount_auto: 1000}
+  monitor_account:        {route: auto,       reversible: true}
+  warn_customer:          {route: auto,       reversible: true}
+  request_step_up_auth:   {route: auto,       reversible: true}
+  request_customer_validation: {route: auto,  reversible: true}
+  request_analyst_info:   {route: auto,       reversible: true}
+  create_case:            {route: auto,       reversible: true}
+  escalate_to_analyst:    {route: auto,       reversible: true}
+  block_card:             {route: analyst,    reversible: true}
+  block_account:          {route: senior,     reversible: false}
+  refund_customer:        {route: analyst,    reversible: false}
+  file_sar:               {route: compliance, reversible: false}
+  close_case:             {route: analyst,    reversible: false}
+  add_to_watchlist:       {route: analyst,    reversible: true}
+
+# Suspicious Activity Report rules (31 CFR 1020.320 style defaults)
+sar:
+  required_if_fraud_and_amount_at_least: 5000     # suspect identified
+  required_if_amount_at_least_any: 25000          # regardless of suspect
+  aggregate_window_days: 30                       # related-activity aggregation
+  required_patterns_any_amount: [fraud_ring, money_mule, synthetic_identity]
+  deadline_days: 30
+
+# Controlled evidence-gathering actions. For each outcome: probability of observing it if the
+# activity is fraud (pf) vs legitimate (pl). The ratio pf/pl is the likelihood ratio used to
+# update the posterior; the pair lets the agent compute the expected value of asking.
+evidence_requests:
+  request_customer_validation:
+    description: Ask the account owner through the registered channel to confirm or deny the transaction
+    outcomes:
+      denied:      {pf: 0.82, pl: 0.04}
+      confirmed:   {pf: 0.06, pl: 0.84}
+      no_response: {pf: 0.12, pl: 0.12}
+    friction: 2
+    applicable_triggers: [risk_signal, analyst]      # a customer report already is the customer's statement
+  request_step_up_auth:
+    description: Challenge the next session / transaction with step-up (OTP or biometric) authentication
+    outcomes:
+      failed:    {pf: 0.45, pl: 0.05}
+      abandoned: {pf: 0.30, pl: 0.10}
+      passed:    {pf: 0.25, pl: 0.85}
+    friction: 1
+    applicable_triggers: [risk_signal, analyst, customer_report]
+  request_analyst_info:
+    description: Ask an analyst / approved party for merchant delivery, KYC or chargeback-history confirmation
+    outcomes:
+      adverse:      {pf: 0.55, pl: 0.08}
+      benign:       {pf: 0.10, pl: 0.60}
+      inconclusive: {pf: 0.35, pl: 0.32}
+    friction: 3
+    applicable_triggers: [risk_signal, analyst, customer_report]

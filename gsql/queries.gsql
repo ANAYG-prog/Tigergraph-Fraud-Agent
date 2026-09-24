@@ -1,0 +1,168 @@
+// Installed queries used by the investigation agent (called through TigerGraph MCP
+// `tigergraph__run_installed_query`). `degree` on entity vertices = number of distinct
+// customers that used the entity (computed at load); entities above max_hub are hubs
+// (gmail.com, a common browser build...) and carry no linkage signal.
+// All queries are point-in-time: nothing after the trigger transaction's timestamp is read.
+USE GRAPH FraudGraph
+
+// ---------------------------------------------------------------- 1. transaction context
+CREATE OR REPLACE QUERY txn_context(VERTEX<Transaction> t) FOR GRAPH FraudGraph SYNTAX v2 {
+  SetAccum<STRING> @rel;
+  S = {t};
+  E = SELECT e FROM S:s -((MADE|PAID_WITH|USED_DEVICE|FROM_NETWORK|PURCHASER_EMAIL|RECIPIENT_EMAIL|BILLED_TO)):ed- :e
+      ACCUM e.@rel += ed.type;
+  PRINT S AS txn;
+  PRINT E AS entities;
+}
+
+// ---------------------------------------------------------------- 2. behavioural profile
+CREATE OR REPLACE QUERY customer_profile(VERTEX<Customer> c, INT before_ts, INT window_days = 180) FOR GRAPH FraudGraph SYNTAX v2 {
+  SumAccum<INT> @@n, @@n24h, @@n1h, @@small24h, @@n7d;
+  SumAccum<DOUBLE> @@amt, @@amt2, @@amt24h;
+  MaxAccum<DOUBLE> @@maxAmt, @@maxRisk;
+  MinAccum<INT> @@firstTs = 2147483647;
+  MaxAccum<INT> @@lastTs;
+  SetAccum<STRING> @@devices, @@emails, @@cards, @@addrs, @@nets;
+  INT lo = before_ts - window_days * 86400;
+
+  S = {c};
+  T = SELECT t FROM S:s -(MADE)- Transaction:t
+      WHERE t.ts < before_ts AND t.ts >= lo
+      ACCUM @@n += 1, @@amt += t.amount, @@amt2 += t.amount * t.amount,
+            @@maxAmt += t.amount, @@maxRisk += t.risk_score, @@firstTs += t.ts, @@lastTs += t.ts,
+            IF t.ts >= before_ts - 7 * 86400 THEN @@n7d += 1 END,
+            IF t.ts >= before_ts - 86400 THEN @@n24h += 1, @@amt24h += t.amount,
+               IF t.amount < 10 THEN @@small24h += 1 END END,
+            IF t.ts >= before_ts - 3600 THEN @@n1h += 1 END;
+  D = SELECT d FROM T:t -(USED_DEVICE)- Device:d ACCUM @@devices += d.device_key;
+  M = SELECT m FROM T:t -(PURCHASER_EMAIL)- Email:m ACCUM @@emails += m.domain;
+  K = SELECT k FROM T:t -(PAID_WITH)- Card:k ACCUM @@cards += k.card_key;
+  A = SELECT a FROM T:t -(BILLED_TO)- Address:a ACCUM @@addrs += a.addr_key;
+  N = SELECT x FROM T:t -(FROM_NETWORK)- Network:x ACCUM @@nets += x.net_key;
+
+  PRINT @@n AS n_txn, @@amt AS sum_amt, @@amt2 AS sum_amt2, @@maxAmt AS max_amt, @@maxRisk AS max_risk,
+        @@firstTs AS first_ts, @@lastTs AS last_ts, @@n7d AS n_7d, @@n24h AS n_24h, @@n1h AS n_1h,
+        @@small24h AS small_24h, @@amt24h AS amt_24h,
+        @@devices AS devices, @@emails AS emails, @@cards AS cards, @@addrs AS addrs, @@nets AS nets;
+}
+
+// ---------------------------------------------------------------- 3. shared-entity links
+// For each non-hub entity of the trigger txn: other customers who used it (up to the trigger time),
+// their risk, and how many of them have confirmed-fraud history (case memory on Customer).
+CREATE OR REPLACE QUERY entity_links(VERTEX<Transaction> t, INT max_hub = 60) FOR GRAPH FraudGraph SYNTAX v2 {
+  MaxAccum<INT> @@tts;
+  SetAccum<VERTEX<Customer>> @@owner;
+  SetAccum<VERTEX<Customer>> @custs, @fraudCusts, @clearedCusts;
+  SumAccum<INT> @ntx;
+  AvgAccum @risk;
+  SumAccum<DOUBLE> @amt;
+
+  S = {t};
+  S = SELECT s FROM S:s ACCUM @@tts += s.ts;
+  O = SELECT c FROM S:s -(MADE)- Customer:c ACCUM @@owner += c;
+  Ents = SELECT e FROM S:s -((USED_DEVICE|FROM_NETWORK|PAID_WITH|BILLED_TO|PURCHASER_EMAIL))- :e
+         WHERE e.degree <= max_hub;
+  X = SELECT c FROM Ents:e -((USED_DEVICE|FROM_NETWORK|PAID_WITH|BILLED_TO|PURCHASER_EMAIL))- Transaction:t2 -(MADE)- Customer:c
+      WHERE t2.ts <= @@tts AND t2 != t AND NOT @@owner.contains(c)
+      ACCUM e.@custs += c, e.@ntx += 1, e.@risk += t2.risk_score, e.@amt += t2.amount,
+            IF c.prior_fraud > 0 THEN e.@fraudCusts += c END,
+            IF c.prior_cleared > 0 THEN e.@clearedCusts += c END;
+  PRINT Ents[Ents.degree AS degree, Ents.@custs.size() AS other_customers, Ents.@ntx AS other_txns,
+             Ents.@risk AS avg_risk, Ents.@amt AS other_amount,
+             Ents.@fraudCusts.size() AS fraud_customers, Ents.@clearedCusts.size() AS cleared_customers,
+             Ents.@custs AS customer_ids];
+}
+
+// ---------------------------------------------------------------- 4. ring expansion (bounded BFS)
+// Customers reachable from the trigger customer through non-hub shared Device/Network/Card entities.
+CREATE OR REPLACE QUERY ring_expand(VERTEX<Customer> c, INT before_ts, INT hops = 3, INT max_hub = 60, INT max_members = 500) FOR GRAPH FraudGraph SYNTAX v2 {
+  OrAccum @seen;
+  MinAccum<INT> @depth;
+  SumAccum<DOUBLE> @@amount;
+  SumAccum<INT> @@txns;
+  AvgAccum @@risk;
+  SetAccum<VERTEX> @@ents;
+  INT h = 0;
+
+  Frontier = {c};
+  Frontier = SELECT s FROM Frontier:s POST-ACCUM s.@seen = TRUE, s.@depth = 0;
+  Members = Frontier;
+  WHILE Frontier.size() > 0 AND h < hops AND Members.size() < max_members DO
+    h = h + 1;
+    Ents = SELECT e FROM Frontier:s -(MADE)- Transaction:t -((USED_DEVICE|FROM_NETWORK|PAID_WITH))- :e
+           WHERE t.ts <= before_ts AND e.degree <= max_hub AND e.degree > 1
+           ACCUM @@ents += e;
+    Frontier = SELECT m FROM Ents:e -((USED_DEVICE|FROM_NETWORK|PAID_WITH))- Transaction:t2 -(MADE)- Customer:m
+               WHERE t2.ts <= before_ts AND m.@seen == FALSE
+               POST-ACCUM m.@seen = TRUE, m.@depth = h;
+    Members = Members UNION Frontier;
+  END;
+  R = SELECT t FROM Members:m -(MADE)- Transaction:t WHERE t.ts <= before_ts AND t.ts >= before_ts - 30 * 86400
+      ACCUM @@amount += t.amount, @@txns += 1, @@risk += t.risk_score;
+  PRINT Members.size() AS ring_size, @@ents.size() AS shared_entities, @@amount AS amount_30d,
+        @@txns AS txns_30d, @@risk AS avg_risk_30d;
+  PRINT Members[Members.@depth AS depth, Members.prior_fraud AS prior_fraud,
+                Members.prior_cleared AS prior_cleared, Members.community AS community];
+}
+
+// ---------------------------------------------------------------- 5. case memory via the graph
+// Prior cases attached to the same customer, or to any non-hub entity the trigger txn shares.
+CREATE OR REPLACE QUERY related_cases(VERTEX<Transaction> t, INT max_hub = 60) FOR GRAPH FraudGraph SYNTAX v2 {
+  MaxAccum<INT> @@tts;
+  SetAccum<STRING> @via;
+  S = {t};
+  S = SELECT s FROM S:s ACCUM @@tts += s.ts;
+  C1 = SELECT fc FROM S:s -(MADE)- Customer:c -(CASE_CUSTOMER)- FraudCase:fc
+       WHERE fc.opened_ts < @@tts AND fc.is_benchmark == FALSE
+       ACCUM fc.@via += "same_customer";
+  C2 = SELECT fc FROM S:s -((USED_DEVICE|FROM_NETWORK|PAID_WITH|BILLED_TO))- :e -((USED_DEVICE|FROM_NETWORK|PAID_WITH|BILLED_TO))- Transaction:t2 -(CASE_TXN)- FraudCase:fc
+       WHERE e.degree <= max_hub AND t2 != t AND fc.opened_ts < @@tts AND fc.is_benchmark == FALSE
+       ACCUM fc.@via += ("shared_" + e.type);
+  C = C1 UNION C2;
+  PRINT C[C.outcome AS outcome, C.fraud_type AS fraud_type, C.decision AS decision, C.risk AS risk,
+          C.summary AS summary, C.@via AS via];
+}
+
+// ---------------------------------------------------------------- 7. recent timeline (UI + LLM context)
+CREATE OR REPLACE QUERY recent_txns(VERTEX<Customer> c, INT before_ts, INT k = 25) FOR GRAPH FraudGraph SYNTAX v2 {
+  S = {c};
+  T = SELECT t FROM S:s -(MADE)- Transaction:t WHERE t.ts <= before_ts ORDER BY t.ts DESC LIMIT k;
+  PRINT T;
+}
+
+// ---------------------------------------------------------------- 8. graph algorithm: WCC communities
+// Weakly-connected components of customers linked through non-hub shared Device / Network / Card.
+// Stored on Customer.community; used as a ring feature and in the UI.
+CREATE OR REPLACE QUERY build_communities(INT max_hub = 60, INT max_iter = 30) FOR GRAPH FraudGraph SYNTAX v2 {
+  MinAccum<INT> @cc;
+  SumAccum<INT> @prev;
+  OrAccum @changed;
+  MapAccum<INT, SumAccum<INT>> @@sizes;
+  INT it = 0;
+  Custs = {Customer.*};
+  Custs = SELECT c FROM Custs:c POST-ACCUM c.@cc = getvid(c), c.@prev = getvid(c);
+  Active = Custs;
+  WHILE Active.size() > 0 AND it < max_iter DO
+    it = it + 1;
+    T = SELECT t FROM Active:c -(MADE)- Transaction:t ACCUM t.@cc += c.@cc;
+    E = SELECT e FROM T:t -((USED_DEVICE|FROM_NETWORK|PAID_WITH))- :e
+        WHERE e.degree <= max_hub AND e.degree > 1 ACCUM e.@cc += t.@cc;
+    T2 = SELECT t FROM E:e -((USED_DEVICE|FROM_NETWORK|PAID_WITH))- Transaction:t ACCUM t.@cc += e.@cc;
+    Active = SELECT c FROM T2:t -(MADE)- Customer:c ACCUM c.@cc += t.@cc
+             POST-ACCUM c.@changed = (c.@cc < c.@prev), c.@prev = c.@cc
+             HAVING c.@changed;
+  END;
+  Custs = SELECT c FROM Custs:c POST-ACCUM c.community = c.@cc, @@sizes += (c.@cc -> 1);
+  PRINT it AS iterations, @@sizes.size() AS communities;
+}
+
+// ---------------------------------------------------------------- 9. community stats for one customer
+CREATE OR REPLACE QUERY community_stats(VERTEX<Customer> c) FOR GRAPH FraudGraph SYNTAX v2 {
+  MaxAccum<INT> @@cc;
+  SumAccum<INT> @@size, @@fraud, @@cleared;
+  S = {c};
+  S = SELECT s FROM S:s ACCUM @@cc += s.community;
+  M = SELECT m FROM Customer:m WHERE m.community == @@cc
+      ACCUM @@size += 1, IF m.prior_fraud > 0 THEN @@fraud += 1 END, IF m.prior_cleared > 0 THEN @@cleared += 1 END;
+  PRINT @@cc AS community, @@size AS size, @@fraud AS fraud_members, @@cleared AS cleared_members;
+}

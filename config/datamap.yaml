@@ -1,0 +1,64 @@
+# Maps the HHGOA_IEEE dataset onto the agent's internal model.
+# Each logical column lists candidate names; the loader uses the first one present
+# (case-insensitive). Edit this file — not the code — if the dataset README names differ.
+
+files:
+  transactions: ["*transaction*.csv", "*transaction*.parquet", "*train_transaction*"]
+  identity:     ["*identity*.csv", "*identity*.parquet"]
+  closed_cases: ["*closed*case*.*", "*historical*case*.*", "*prior*case*.*", "*investigation*.csv", "*cases_history*"]
+  benchmark:    ["*benchmark*.*", "*eval*case*.*", "*test_case*.*", "*cases_to_investigate*", "*open*case*.*"]
+  evidence:     ["*evidence*response*.*", "*customer_response*.*", "*additional_evidence*.*", "*evidence*.json*", "*evidence*.csv"]
+  customers:    ["*customer*.csv", "*customer*.parquet"]
+  docs:         ["*.md", "*.txt", "*.pdf", "*.docx"]     # policy, patterns, regulations (README excluded)
+
+transaction:
+  txn_id:      [TransactionID, transaction_id, txn_id]
+  ts:          [TransactionDT, transaction_dt, ts]
+  amount:      [TransactionAmt, amount, transaction_amt]
+  product:     [ProductCD, product_cd]
+  customer_id: [customer_id, CustomerID, cust_id, client_id, uid]
+  risk_score:  [risk_score, RiskScore, fraud_score, model_score, score]
+  card:        [card1, card2, card3, card4, card5, card6]
+  addr1:       [addr1]
+  addr2:       [addr2]
+  dist1:       [dist1]
+  dist2:       [dist2]
+  p_email:     [P_emaildomain, p_emaildomain]
+  r_email:     [R_emaildomain, r_emaildomain]
+
+identity:
+  txn_id:      [TransactionID, transaction_id]
+  device_type: [DeviceType]
+  device_info: [DeviceInfo]
+  os:          [id_30, id-30]
+  browser:     [id_31, id-31]
+  screen:      [id_33, id-33]
+  proxy:       [id_23, id-23]
+  ip_hint:     [id_17, id-17]
+  net:         [id_19, id-19]
+  net2:        [id_20, id-20]
+
+case:
+  case_id:      [case_id, CaseID, id]
+  txn_id:       [transaction_id, TransactionID, txn_id, trigger_transaction_id]
+  customer_id:  [customer_id, CustomerID]
+  outcome:      [outcome, disposition, resolution, status, label, final_decision]
+  fraud_type:   [fraud_type, pattern, typology, fraud_pattern, category]
+  trigger:      [trigger_type, trigger, source, trigger_source]
+  trigger_text: [trigger_detail, description, summary, notes, report_text, narrative]
+  actions:      [actions_taken, actions, action]
+  opened_ts:    [opened_dt, open_dt, opened_at, created_at, TransactionDT]
+
+# Values in the outcome column that mean fraud was confirmed / cleared.
+outcome_values:
+  fraud:   [confirmed, confirmed_fraud, fraud, true_positive, "1", "true", yes]
+  cleared: [cleared, not_fraud, legitimate, false_positive, "0", "false", no, genuine]
+
+# TransactionDT is seconds from this reference date (IEEE-CIS convention).
+reference_date: "2017-12-01"
+
+# Entity hubs: values shared by so many customers that they carry no linkage signal.
+hub_thresholds:
+  Email: 400       # gmail.com, yahoo.com ...
+  Device: 60       # "Windows|Windows 10|chrome|1920x1080"
+  Address: 800

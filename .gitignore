@@ -1,0 +1,13 @@
+# secrets / local environment
+.env
+.venv/
+
+# dataset (download separately, see README) and local caches
+data/
+.cache/
+__pycache__/
+*.pyc
+
+# generated outputs: synthetic dev runs are never committed; real HHGOA answers are added deliberately
+outputs/synthetic/
+outputs/**/action_log.jsonl
